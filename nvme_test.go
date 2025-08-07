@@ -293,6 +293,30 @@ func TestNVME_Connector_ConnectVolume(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:   "nvme session but no disks",
+			fields: getDefaultNVMEFields(ctrl),
+			stateSetter: func(fields NVMEFields) {
+				fields.multipath.EXPECT().IsDaemonRunning(gomock.Any()).Return(true).AnyTimes()
+				fields.multipath.EXPECT().AddPath(gomock.Any(), gomock.Any()).AnyTimes()
+				fields.nvmeLib.EXPECT().GetSessions().Return(validLibNVMESessions, nil).AnyTimes()
+				fields.nvmeLib.EXPECT().ListNVMeDeviceAndNamespace().Return([]gonvme.DevicePathAndNamespace{}, nil).AnyTimes()
+				//These below only happen when race is detected
+				fields.scsi.EXPECT().GetNVMEDMDeviceByChildren(gomock.Any(), gomock.Any()).Return("naa.68ccf098000f8da9098125406239914f", nil).AnyTimes()
+				fields.scsi.EXPECT().WaitUdevSymlinkNVMe(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+				fields.scsi.EXPECT().CheckDeviceIsValid(gomock.Any(), gomock.Any()).Return(false).AnyTimes()
+			},
+			args: args{
+				ctx: ctx,
+				info: NVMeVolumeInfo{
+					Targets: []NVMeTargetInfo{validNVMETargetInfo1},
+					WWN:     "naa.68ccf098000f8da9098125406239914f",
+				},
+				useFc: false,
+			},
+			want:    Device{},
+			wantErr: true,
+		},
+		{
 			name:   "nvme session found and Device is not valid",
 			fields: getDefaultNVMEFields(ctrl),
 			stateSetter: func(fields NVMEFields) {
@@ -779,48 +803,6 @@ func TestNVME_Connector_tryNVMeConnect(t *testing.T) {
 			err := c.tryNVMeConnect(tt.args.ctx, tt.args.info, tt.args.useFC)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("tryNVMeConnect() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestNVME_readNVMeDevicesFromResultCH(t *testing.T) {
-	tests := []struct {
-		name             string
-		devicePathResult DevicePathResult
-		expectedPaths    []string
-		expectedNguid    string
-	}{
-		{
-			name: "Single device path",
-			devicePathResult: DevicePathResult{
-				devicePaths: []string{"/dev/nvme0n1"},
-				nguid:       "test-nguid-1",
-			},
-			expectedPaths: []string{"nvme0n1"},
-			expectedNguid: "test-nguid-1",
-		},
-		{
-			name: "Multiple device paths",
-			devicePathResult: DevicePathResult{
-				devicePaths: []string{"/dev/nvme0n1", "/dev/nvme1n1"},
-				nguid:       "test-nguid-2",
-			},
-			expectedPaths: []string{"nvme0n1", "nvme1n1"},
-			expectedNguid: "test-nguid-2",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ch := make(chan DevicePathResult, 1)
-			ch <- tt.devicePathResult
-			gotPaths, gotNguid := readNVMeDevicesFromResultCH(ch, nil)
-			if !reflect.DeepEqual(gotPaths, tt.expectedPaths) {
-				t.Errorf("readNVMeDevicesFromResultCH() gotPaths = %v, expectedPaths %v", gotPaths, tt.expectedPaths)
-			}
-			if gotNguid != tt.expectedNguid {
-				t.Errorf("readNVMeDevicesFromResultCH() gotNguid = %v, expectedNguid %v", gotNguid, tt.expectedNguid)
 			}
 		})
 	}

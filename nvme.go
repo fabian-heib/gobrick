@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"path"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/dell/gobrick/internal/logger"
@@ -303,22 +302,11 @@ func (c *NVMeConnector) cleanConnection(ctx context.Context, force bool, info NV
 
 func (c *NVMeConnector) connectSingleDevice(ctx context.Context, info NVMeVolumeInfo, useFC bool) (Device, error) {
 	defer tracer.TraceFuncCall(ctx, "NVMeConnector.connectSingleDevice")()
-	devCH := make(chan DevicePathResult)
-	wg := sync.WaitGroup{}
+
 	discoveryCtx, cFunc := context.WithTimeout(ctx, c.waitDeviceTimeout)
 	defer cFunc()
 
-	wg.Add(1)
-	go c.discoverDevice(discoveryCtx, &wg, devCH, info, useFC)
-	// for non blocking wg wait
-	wgCH := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(wgCH)
-	}()
-
-	var devices []string
-	var discoveryComplete, lastTry bool
+	var lastTry bool
 	var endTime time.Time
 	wwn := info.WWN
 
@@ -329,18 +317,9 @@ func (c *NVMeConnector) connectSingleDevice(ctx context.Context, info NVMeVolume
 			return Device{}, errors.New("connectSingleDevice canceled")
 		default:
 		}
-		devices, nguid := readNVMeDevicesFromResultCH(devCH, devices)
-		// check all discovery gorutines finished
-		if !discoveryComplete {
-			select {
-			case <-wgCH:
-				discoveryComplete = true
-				logger.Info(ctx, "all discovery goroutines complete")
-			default:
-				logger.Info(ctx, "discovery goroutines are still running")
-			}
-		}
-		if discoveryComplete && len(devices) == 0 {
+		devices, nguid := c.discoverDevice(discoveryCtx, info, useFC)
+
+		if len(devices) == 0 {
 			msg := "discovery complete but devices not found"
 			logger.Error(ctx, msg)
 			return Device{}, errors.New(msg)
@@ -356,7 +335,7 @@ func (c *NVMeConnector) connectSingleDevice(ctx context.Context, info NVMeVolume
 			}
 			return Device{Name: devices[0], WWN: wwn}, nil
 		}
-		if discoveryComplete && !lastTry {
+		if !lastTry {
 			logger.Info(ctx, "discovery finished, wait %f seconds for device registration",
 				c.waitDeviceRegisterTimeout.Seconds())
 			lastTry = true
@@ -375,24 +354,14 @@ func (c *NVMeConnector) connectMultipathDevice(
 	ctx context.Context, _ []gonvme.NVMESession, info NVMeVolumeInfo, useFC bool,
 ) (Device, error) {
 	defer tracer.TraceFuncCall(ctx, "NVMeConnector.connectMultipathDevice")()
-	devCH := make(chan DevicePathResult)
-	wg := sync.WaitGroup{}
+
 	discoveryCtx, cFunc := context.WithTimeout(ctx, c.waitDeviceTimeout)
 	defer cFunc()
-
-	wg.Add(1)
-	go c.discoverDevice(discoveryCtx, &wg, devCH, info, useFC)
-	// for non blocking wg wait
-	wgCH := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(wgCH)
-	}()
 
 	var devices []string
 	var mpath string
 	wwn := info.WWN
-	var wwnAdded, discoveryComplete, lastTry bool
+	var wwnAdded, lastTry bool
 	var endTime time.Time
 	nguid := ""
 	for {
@@ -403,20 +372,10 @@ func (c *NVMeConnector) connectMultipathDevice(
 		default:
 		}
 		if nguid == "" {
-			devices, nguid = readNVMeDevicesFromResultCH(devCH, devices)
+			devices, nguid = c.discoverDevice(discoveryCtx, info, useFC)
 		}
 
-		// check all discovery gorutines finished
-		if !discoveryComplete {
-			select {
-			case <-wgCH:
-				discoveryComplete = true
-				logger.Info(ctx, "all discover goroutines complete")
-			default:
-				logger.Info(ctx, "discover goroutines are still running")
-			}
-		}
-		if discoveryComplete && len(devices) == 0 {
+		if len(devices) == 0 {
 			msg := "discover complete but devices not found"
 			logger.Error(ctx, msg)
 			return Device{}, errors.New(msg)
@@ -447,7 +406,7 @@ func (c *NVMeConnector) connectMultipathDevice(
 				return Device{WWN: wwn, Name: mpath, MultipathID: wwn}, nil
 			}
 		}
-		if discoveryComplete && !lastTry {
+		if !lastTry {
 			logger.Info(ctx, "discovery finished, wait %f seconds for DM to appear",
 				c.waitDeviceRegisterTimeout.Seconds())
 			lastTry = true
@@ -485,11 +444,9 @@ func (c *NVMeConnector) validateNVMeVolumeInfo(ctx context.Context, info NVMeVol
 	return nil
 }
 
-func (c *NVMeConnector) discoverDevice(ctx context.Context, wg *sync.WaitGroup, result chan DevicePathResult, info NVMeVolumeInfo, useFC bool) {
+func (c *NVMeConnector) discoverDevice(ctx context.Context, info NVMeVolumeInfo, useFC bool) ([]string, string) {
 	defer tracer.TraceFuncCall(ctx, "NVMeConnector.discoverDevice")()
-	defer wg.Done()
 	wwn := info.WWN
-
 	var devicePathResult DevicePathResult
 	retryCount := 0
 	for {
@@ -509,6 +466,7 @@ func (c *NVMeConnector) discoverDevice(ctx context.Context, wg *sync.WaitGroup, 
 			nguid, newnamespace, _ := c.nvmeLib.GetNVMeDeviceData(devicePath)
 			log.Debugf("nguid %s, wwn %s, newnamespace %s, namespace %s", nguid, wwn, newnamespace, namespace)
 			if c.wwnMatches(nguid, wwn) && namespace == newnamespace {
+				devicePath = strings.ReplaceAll(devicePath, "/dev/", "")
 				devicePaths = append(devicePaths, devicePath)
 				nguidResult = nguid
 				// using two nvme devices for each volume for the multipath discovery
@@ -529,7 +487,7 @@ func (c *NVMeConnector) discoverDevice(ctx context.Context, wg *sync.WaitGroup, 
 		retryCount = retryCount + 1
 	}
 
-	result <- devicePathResult
+	return devicePathResult.devicePaths, devicePathResult.nguid
 }
 
 // wwnMatches checks if the given nguid and wwn match.
@@ -610,17 +568,6 @@ func (c *NVMeConnector) tryNVMeConnect(ctx context.Context, info NVMeVolumeInfo,
 		}
 	}
 	return nil
-}
-
-func readNVMeDevicesFromResultCH(ch chan DevicePathResult, _ []string) ([]string, string) {
-	devicePathResult := <-ch
-	var devicePaths []string
-	for _, dpath := range devicePathResult.devicePaths {
-		// modify dpath /dev/nvme0n1 -> nvme0n1
-		newpath := strings.ReplaceAll(dpath, "/dev/", "")
-		devicePaths = append(devicePaths, newpath)
-	}
-	return devicePaths, devicePathResult.nguid
 }
 
 func (c *NVMeConnector) checkNVMeSessions(
